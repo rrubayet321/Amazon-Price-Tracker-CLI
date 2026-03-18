@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Local IDE
+.idea/
+
+# Secrets and runtime state
+.env
+token.txt
+
+# Output artifacts
+price_history.csv
