@@ -10,6 +10,7 @@ import csv
 import os
 import re
 import smtplib
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -98,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not send email; print the alert payload instead.",
     )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Fail instead of prompting for URL input when none is provided.",
+    )
     return parser.parse_args()
 
 
@@ -142,13 +148,10 @@ def infer_product_name(soup: BeautifulSoup) -> str | None:
 
 
 def normalize_price(text: str) -> float:
-    cleaned = text.replace("$", "").replace(",", "").strip()
-    if cleaned.endswith("."):
-        cleaned = cleaned[:-1]
-    if cleaned.count(".") > 1:
-        parts = cleaned.split(".")
-        cleaned = parts[0] + "." + "".join(parts[1:])
-    return float(cleaned)
+    match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
+    if not match:
+        raise ValueError(f"Unable to parse numeric price from: {text!r}")
+    return float(match.group(1).replace(",", ""))
 
 
 def send_email(subject: str, body: str, dry_run: bool = False) -> None:
@@ -178,6 +181,14 @@ def send_email(subject: str, body: str, dry_run: bool = False) -> None:
 
 
 def read_urls_from_file(path: str) -> list[str]:
+    if path == "-":
+        print("Reading URLs from stdin... (one URL per line; Ctrl-D to finish)")
+        return [
+            line.strip()
+            for line in sys.stdin.read().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
     file_path = Path(path)
     if not file_path.exists():
         print(f"URLs file not found: {file_path}")
@@ -201,10 +212,13 @@ def collect_urls(args: argparse.Namespace) -> list[str]:
     if not urls and env_url:
         urls.append(env_url)
 
-    if not urls:
+    if not urls and not args.no_prompt:
         print("No product URL provided.")
         print("Paste one or more Amazon product URLs (comma separated):")
-        entered = input("Amazon URL(s): ").strip()
+        try:
+            entered = input("Amazon URL(s): ").strip()
+        except EOFError:
+            entered = ""
         if entered:
             urls.extend([item.strip() for item in entered.split(",") if item.strip()])
 
@@ -244,6 +258,7 @@ def load_last_prices(history_file: str) -> dict[str, float]:
 
 def append_history(history_file: str, result: PriceResult) -> None:
     path = Path(history_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
     with path.open("a", encoding="utf-8", newline="") as file:
         fields = ["timestamp_utc", "key", "url", "name", "price"]
@@ -261,9 +276,14 @@ def append_history(history_file: str, result: PriceResult) -> None:
         )
 
 
+def is_amazon_host(netloc: str) -> bool:
+    host = netloc.lower().split(":", 1)[0]
+    return host == "amazon.com" or host.endswith(".amazon.com")
+
+
 def fetch_single_price(url: str, custom_name: str | None = None) -> tuple[str, float, str | None]:
     parsed = urlparse(url)
-    if "amazon." not in parsed.netloc:
+    if parsed.scheme not in ("http", "https") or not is_amazon_host(parsed.netloc):
         raise ValueError("URL does not look like an Amazon link.")
 
     product_name = custom_name or "Amazon product"
@@ -295,10 +315,13 @@ def fetch_single_price(url: str, custom_name: str | None = None) -> tuple[str, f
 
     if not price_text:
         mobile_url = f"https://www.amazon.com/gp/aw/d/{asin}" if asin else url
-        response = requests.get(
-            mobile_url, headers=MOBILE_HEADERS, cookies=COOKIES, timeout=10
-        )
-        response.raise_for_status()
+        try:
+            response = requests.get(
+                mobile_url, headers=MOBILE_HEADERS, cookies=COOKIES, timeout=10
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Unable to fetch product page: {exc}") from exc
         match = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]*)", response.text)
         price_text = match.group(0) if match else None
 
@@ -354,12 +377,12 @@ def display_result(result: PriceResult) -> None:
         print(f"Last Seen Price: ${result.previous_price:.2f} ({direction} {abs(delta):.2f})")
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     urls = collect_urls(args)
     if not urls:
         print("No URL entered. Exiting.")
-        return
+        return 1
 
     last_prices = load_last_prices(args.history_file)
     successes = 0
@@ -377,7 +400,10 @@ def main() -> None:
             failures += 1
 
     print(f"\nDone. Successful checks: {successes}, Failed checks: {failures}")
+    if successes == 0 and failures > 0:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
